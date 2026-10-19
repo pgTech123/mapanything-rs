@@ -1,6 +1,6 @@
-//! The full MapAnything model. Images and, when known, camera intrinsics in; per view a
-//! metric point map, confidence, ambiguity mask and camera pose out. The optional depth and
-//! pose inputs are not supported.
+//! The full MapAnything model. Images and, when known, camera intrinsics and poses in; per
+//! view a metric point map, confidence, ambiguity mask and camera pose out. The optional
+//! depth input is not supported.
 
 use candle_core::{DType, Module, Result, Tensor};
 use candle_nn::{LayerNorm, VarBuilder};
@@ -8,9 +8,11 @@ use nalgebra::{Matrix3, Quaternion, UnitQuaternion, Vector3};
 
 use crate::dinov2::{DIM, Dinov2, PATCH_SIZE};
 use crate::dpt::DptHead;
+use crate::global_encoder::GlobalEncoder;
 use crate::heads::{PoseHead, ScaleHead};
 use crate::image_input::Intrinsics;
 use crate::info_sharing::{AlternatingAttention, ViewTokens};
+use crate::pose_prior::PoseInputs;
 use crate::ray_encoder::RayEncoder;
 use crate::vit_block::layer_norm;
 
@@ -56,6 +58,9 @@ fn ray_map(intrinsics: &Intrinsics, height: usize, width: usize, like: &Tensor) 
 pub struct MapAnything {
     encoder: Dinov2,
     ray_encoder: RayEncoder,
+    cam_rot_encoder: GlobalEncoder,
+    cam_trans_encoder: GlobalEncoder,
+    cam_trans_scale_encoder: GlobalEncoder,
     fusion_norm: LayerNorm,
     scale_token: Tensor,
     info_sharing: AlternatingAttention,
@@ -71,6 +76,12 @@ impl MapAnything {
             encoder: Dinov2::new(vb.pp("encoder.model"))?,
             // In f32, as upstream: its features overflow f16.
             ray_encoder: RayEncoder::new(vb.pp("ray_dirs_encoder").set_dtype(DType::F32))?,
+            cam_rot_encoder: GlobalEncoder::new(4, vb.pp("cam_rot_encoder").set_dtype(DType::F32))?,
+            cam_trans_encoder: GlobalEncoder::new(3, vb.pp("cam_trans_encoder").set_dtype(DType::F32))?,
+            cam_trans_scale_encoder: GlobalEncoder::new(
+                1,
+                vb.pp("cam_trans_scale_encoder").set_dtype(DType::F32),
+            )?,
             fusion_norm: layer_norm(DIM, vb.pp("fusion_norm_layer"))?,
             scale_token: vb.get(DIM, "scale_token")?,
             info_sharing: AlternatingAttention::new(vb.pp("info_sharing"))?,
@@ -80,13 +91,34 @@ impl MapAnything {
         })
     }
 
+    /// Pose features of one view, [1, 1, DIM] in f32: rotation and translation relative to
+    /// view 0, plus the translation scale when the poses are metric.
+    fn pose_features(
+        &self,
+        encoding: &crate::pose_prior::PoseEncoding,
+        log_scale: Option<f32>,
+        device: &candle_core::Device,
+    ) -> Result<Tensor> {
+        let quaternion = Tensor::new(&[encoding.quaternion], device)?;
+        let translation = Tensor::new(&[encoding.translation], device)?;
+        let mut features = (self.cam_rot_encoder.forward(&quaternion)?
+            + self.cam_trans_encoder.forward(&translation)?)?;
+        if let Some(log_scale) = log_scale {
+            let scale = Tensor::new(&[[log_scale]], device)?;
+            features = (features + self.cam_trans_scale_encoder.forward(&scale)?)?;
+        }
+        features.unsqueeze(0)
+    }
+
     /// `images`: each [1, 3, H, W], ImageNet-normalized, all the same size, H and W
     /// multiples of PATCH_SIZE. View 0 is the reference view. `intrinsics`: one per image,
-    /// known cameras are given to the model instead of letting it guess.
+    /// known cameras are given to the model instead of letting it guess. `poses`: known
+    /// camera poses, likewise.
     pub fn forward(
         &self,
         images: &[Tensor],
         intrinsics: &[Option<Intrinsics>],
+        poses: Option<&PoseInputs>,
     ) -> Result<Vec<ViewOutput>> {
         assert_eq!(
             images.len(),
@@ -96,13 +128,22 @@ impl MapAnything {
         let (_, _, height, width) = images[0].dims4()?;
         let (patch_h, patch_w) = (height / PATCH_SIZE, width / PATCH_SIZE);
         let patch_count = patch_h * patch_w;
+        let (pose_encodings, pose_scale) = match poses {
+            Some(poses) => {
+                assert_eq!(poses.priors.len(), images.len(), "one pose entry per image");
+                let (encodings, scale) = poses.encodings();
+                let log_scale = poses.metric.then(|| ((scale + 1e-8).ln()) as f32);
+                (encodings, log_scale)
+            }
+            None => (vec![None; images.len()], None),
+        };
 
         let mut views = Vec::with_capacity(images.len());
-        for (image, intrinsics) in images.iter().zip(intrinsics) {
+        for ((image, intrinsics), pose) in images.iter().zip(intrinsics).zip(&pose_encodings) {
             let tokens = self.encoder.forward(image)?;
             let image_patches = tokens.narrow(1, 1, patch_count)?;
             // Known cameras are added to the image features; unknown ones add nothing.
-            let patches = match intrinsics {
+            let mut patches = match intrinsics {
                 Some(intrinsics) => {
                     let rays = ray_map(intrinsics, height, width, image)?.to_dtype(DType::F32)?;
                     let ray_features = self.ray_encoder.forward(&rays)?;
@@ -110,6 +151,10 @@ impl MapAnything {
                 }
                 None => image_patches,
             };
+            if let Some(pose) = pose {
+                let features = self.pose_features(pose, pose_scale, image.device())?;
+                patches = patches.broadcast_add(&features.to_dtype(image.dtype())?)?;
+            }
             views.push(ViewTokens {
                 patches: self.fusion_norm.forward(&patches)?,
                 // The class token joins the transformer without the fusion norm.

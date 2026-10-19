@@ -1636,6 +1636,9 @@ dependencies = [
  "image",
  "kamadak-exif",
  "nalgebra",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

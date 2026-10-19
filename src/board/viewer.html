@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board poses</title>
+<style>
+  :root { color-scheme: dark; --bg: #16181d; --panel: #1f232a; --fg: #e6e6e6; --dim: #9aa0a8; --ok: #4ade80; --bad: #f87171; --accent: #60a5fa; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; display: grid; grid-template-columns: 320px 1fr; grid-template-rows: auto 1fr; height: 100vh; }
+  header { grid-column: 1 / 3; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid #000; display: flex; gap: 24px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  header span { color: var(--dim); }
+  #list { overflow-y: auto; border-right: 1px solid #000; }
+  .item { display: grid; grid-template-columns: 96px 1fr; gap: 8px; padding: 8px; cursor: pointer; border-bottom: 1px solid #0006; }
+  .item:hover { background: #ffffff0a; }
+  .item.active { background: #60a5fa22; }
+  .item img { width: 96px; height: 72px; object-fit: cover; border-radius: 3px; background: #000; }
+  .item .name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .meta { color: var(--dim); font-size: 12px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  #main { display: grid; grid-template-rows: 1fr 1fr; min-height: 0; min-width: 0; overflow: hidden; }
+  #photo { position: relative; display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid #000; }
+  #photo img { flex: 1; min-height: 0; object-fit: contain; background: #000; }
+  #photo .caption { padding: 6px 12px; background: var(--panel); font-size: 13px; }
+  #scene { position: relative; min-height: 0; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; cursor: grab; }
+  #legend { position: absolute; right: 12px; top: 10px; color: var(--dim); font-size: 12px; text-align: right; line-height: 1.6; }
+  #legend b { color: var(--fg); }
+  @media (max-width: 800px) { body { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; } #list { max-height: 30vh; border-right: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Board poses</h1>
+  <span id="summary"></span>
+  <span id="calib"></span>
+</header>
+<div id="list"></div>
+<div id="main">
+  <div id="photo"><img id="big" alt=""><div class="caption" id="caption">Select a photo</div></div>
+  <div id="scene">
+    <canvas id="c"></canvas>
+    <div id="legend">drag to orbit, wheel to zoom<br><b>red x</b> long axis · <b>green y</b> short axis · <b>blue z</b> up<br>click a camera to select its photo</div>
+  </div>
+</div>
+<script>
+const DATA = /*DATA*/null;
+const views = DATA.views;
+const found = views.filter(v => v.found);
+document.getElementById('summary').textContent = `${found.length} of ${views.length} photos posed · board ${DATA.board[0]}x${DATA.board[1]} inner corners · RMS ${DATA.rms.toFixed(2)} px`;
+const K = DATA.intrinsics;
+document.getElementById('calib').textContent = `f ${K.f.toFixed(1)} px · center (${K.cx.toFixed(1)}, ${K.cy.toFixed(1)}) · k1 ${K.k1.toFixed(4)} k2 ${K.k2.toFixed(4)}`;
+
+let selected = -1;
+const list = document.getElementById('list');
+views.forEach((v, i) => {
+  const el = document.createElement('div');
+  el.className = 'item'; el.dataset.i = i;
+  const c = v.center ? `(${v.center.map(x => x.toFixed(1)).join(', ')})` : '';
+  el.innerHTML = `<img src="${v.overlay}" loading="lazy"><div><div class="name" title="${v.name}">${v.name}</div>
+    <div class="meta ${v.found ? 'ok' : 'bad'}">${v.found ? 'pose ' + c : 'no pose'}</div>
+    <div class="meta">${v.corners_used}/${v.corners_detected} corners${v.rms != null ? ' · ' + v.rms.toFixed(2) + ' px' : ''}</div></div>`;
+  el.onclick = () => select(i);
+  list.appendChild(el);
+});
+function select(i) {
+  selected = i;
+  document.querySelectorAll('.item').forEach(e => e.classList.toggle('active', +e.dataset.i === i));
+  const v = views[i];
+  document.getElementById('big').src = v.overlay;
+  document.getElementById('caption').innerHTML = `<b>${v.name}</b> — ${v.found ? 'camera at (' + v.center.map(x => x.toFixed(2)).join(', ') + ') squares, RMS ' + v.rms.toFixed(2) + ' px — ' : ''}${v.note}
+    <span style="color:var(--dim)"> · green: corners used, red: detected but unused, cyan: board corners extrapolated from the pose, blue: board outline</span>`;
+  draw();
+}
+
+// --- 3D view: simple orbit camera, orthographic-ish perspective projection on a canvas.
+const canvas = document.getElementById('c'); const ctx = canvas.getContext('2d');
+const [NL, NS] = DATA.board;
+const target = [(NL - 1) / 2, (NS - 1) / 2, 0];
+let yaw = -0.7, pitch = 0.9, dist = Math.max(NL, NS) * 2.4;
+function rot(p) {
+  let [x, y, z] = [p[0] - target[0], p[1] - target[1], p[2] - target[2]];
+  let x1 = x * Math.cos(yaw) - y * Math.sin(yaw), y1 = x * Math.sin(yaw) + y * Math.cos(yaw);
+  let y2 = y1 * Math.cos(pitch) + z * Math.sin(pitch), z2 = -y1 * Math.sin(pitch) + z * Math.cos(pitch);
+  return [x1, y2, z2];
+}
+function proj(p) {
+  const [x, y, z] = rot(p);
+  const d = dist - z; if (d <= 0.1) return null;
+  const f = canvas.height * 0.9;
+  return [canvas.width / 2 + f * x / d, canvas.height / 2 - f * y / d, d];
+}
+function seg(a, b, color, w = 1) {
+  const pa = proj(a), pb = proj(b); if (!pa || !pb) return;
+  ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+}
+const camHits = [];
+function draw() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = r.width * devicePixelRatio; canvas.height = r.height * devicePixelRatio;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Board: squares (one beyond the inner corners on each side).
+  for (let i = -1; i < NL; i++) for (let j = -1; j < NS; j++) {
+    const black = ((i + j) % 2 + 2) % 2 === 0;
+    const q = [[i - 0.5, j - 0.5], [i + 0.5, j - 0.5], [i + 0.5, j + 0.5], [i - 0.5, j + 0.5]].map(([x, y]) => proj([x, y, 0]));
+    if (q.some(p => !p)) continue;
+    ctx.fillStyle = black ? '#2b2f36' : '#cfd3d8'; ctx.beginPath(); q.forEach((p, k) => k ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fill();
+  }
+  seg([0, 0, 0], [2, 0, 0], '#ef4444', 3); seg([0, 0, 0], [0, 2, 0], '#22c55e', 3); seg([0, 0, 0], [0, 0, 2], '#3b82f6', 3);
+  // Cameras: small frustums, drawn far to near.
+  camHits.length = 0;
+  const cams = views.map((v, i) => ({ v, i })).filter(o => o.v.found);
+  cams.sort((a, b) => rot(b.v.center)[2] - rot(a.v.center)[2]);
+  for (const { v, i } of cams) {
+    const m = v.cam_to_world; const c = v.center;
+    const ax = k => [m[0][k], m[1][k], m[2][k]];
+    const [X, Y, Z] = [ax(0), ax(1), ax(2)];
+    const s = 0.9, fz = 1.0 * s, w = (v.width / v.height) * 0.55 * s, h = 0.55 * s;
+    const corner = (sx, sy) => [0, 1, 2].map(k => c[k] + Z[k] * fz + X[k] * sx * w + Y[k] * sy * h);
+    const q = [corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1)];
+    const color = i === selected ? '#fbbf24' : '#60a5fa';
+    for (let k = 0; k < 4; k++) { seg(c, q[k], color, i === selected ? 2 : 1); seg(q[k], q[(k + 1) % 4], color, i === selected ? 2 : 1); }
+    seg(q[0], q[1], '#f87171', 2); // top edge of the image in red
+    const p = proj(c); if (p) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(p[0], p[1], 4 * devicePixelRatio, 0, 7); ctx.fill(); camHits.push({ x: p[0], y: p[1], i }); }
+    if (i === selected && p) { ctx.fillStyle = '#fbbf24'; ctx.font = `${12 * devicePixelRatio}px system-ui`; ctx.fillText(v.name, p[0] + 8, p[1] - 8); }
+  }
+}
+let dragging = false, lx = 0, ly = 0, moved = 0;
+canvas.onpointerdown = e => { dragging = true; moved = 0; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); };
+canvas.onpointermove = e => { if (!dragging) return; moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly); yaw += (e.clientX - lx) * 0.01; pitch = Math.max(0.05, Math.min(1.55, pitch + (e.clientY - ly) * 0.01)); lx = e.clientX; ly = e.clientY; draw(); };
+canvas.onpointerup = e => {
+  dragging = false;
+  if (moved > 4) return;
+  const r = canvas.getBoundingClientRect(); const x = (e.clientX - r.left) * devicePixelRatio, y = (e.clientY - r.top) * devicePixelRatio;
+  let best = null, bd = 15 * devicePixelRatio;
+  for (const h of camHits) { const d = Math.hypot(h.x - x, h.y - y); if (d < bd) { bd = d; best = h.i; } }
+  if (best != null) select(best);
+};
+canvas.onwheel = e => { e.preventDefault(); dist *= Math.exp(e.deltaY * 0.001); draw(); };
+window.onresize = draw;
+draw();
+if (views.length) select(views.findIndex(v => v.found) >= 0 ? views.findIndex(v => v.found) : 0);
+</script>
+</body>
+</html>

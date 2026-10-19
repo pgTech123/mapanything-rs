@@ -28,6 +28,10 @@ download from Hugging Face into `~/.cache/huggingface`. No account is needed.
 | `--precision` | `f16` | `f32`, `f16` or `bf16` |
 | `--weights` | Hugging Face download | local `.safetensors` checkpoint |
 | `--raw-out` | none | also save dense per-image points, confidence, mask and cameras as `.safetensors` |
+| `--checkerboard` | off | estimate every camera's pose from a checkerboard the object stands on and give the poses to the model; output in the board frame, z up (see below) |
+| `--board-size` | detected | inner corner counts of the board, long axis first, e.g. `9x6` for 10x7 squares |
+| `--square-m` | none | side of a board square in meters, to give the poses to the model as metric |
+| `--board-debug` | none | folder for the board detection debug output: overlays, `poses.json`, `index.html` viewer |
 | `--cpu` | off | run on the CPU instead of Metal |
 
 To view the result, open the `.ply` in [MeshLab](https://www.meshlab.net),
@@ -132,3 +136,53 @@ are Apache 2.0. The similarly named `facebook/map-anything` is CC BY-NC 4.0 (non
 - [UniCeption](https://github.com/castacks/UniCeption) by AirLab
 - [DINOv2](https://github.com/facebookresearch/dinov2) by Meta
 - [candle](https://github.com/huggingface/candle) by Hugging Face
+
+## Camera poses from a checkerboard
+
+MapAnything guesses camera poses, and does it worst on object-centric captures. It also
+takes poses as optional input (it was trained with them dropped out at random), and the
+Apache checkpoint includes the encoders. With `--checkerboard`, the object stands on a
+printed checkerboard, every photo's pose is estimated from the board first, and the poses
+go into the model with the images:
+
+```sh
+cargo run --release -- photos/*.jpg --checkerboard --board-debug debug --out scene.ply
+```
+
+The board may be partly hidden by the object or cut off by the frame: the visible corners
+are grouped into a lattice, the lattice is placed on the physical board by looking for the
+board's edges (where the squares give way to paper) and the checker colors, and the hidden
+corners are extrapolated. The camera is calibrated from all photos together (focal length,
+principal point, two radial distortion coefficients), along with an out-of-plane offset per
+board corner, since a paper board is never flat; on the duck capture that term brings the
+reprojection error from 2.0 px to 0.45 px. The calibrated focal length replaces the EXIF
+one.
+
+Each pose is encoded as upstream does: the rotation as a quaternion and the translation
+relative to view 0, normalized by the mean camera distance, through small MLPs whose output
+is added to every patch token, like the ray directions of known intrinsics. Photos where
+the board is not placed uniquely (neither of its edges visible along an axis, so a shift by
+whole squares cannot be told apart) are listed with the reason and take part with the
+model's own pose estimate; if no photo has a pose, a warning is printed and the run
+continues as without the flag. The point cloud comes out in the board frame (x along the
+long axis, y along the short axis, z up) at the model's scale, and the run prints how far
+the model's predicted poses are from the given ones.
+
+On the duck capture (22 photos, 21 with a pose) this brings the model's camera poses from
+2.9 degrees and half a square of error down to 0.2 degrees and 0.4 % of the camera
+distance, and the board plane lands at z = 0 in every view, where the model's own pose
+chain drifted by a few degrees and a third of a square. Surface noise within a view is
+unchanged.
+
+`--board-debug` writes a viewer, `index.html`: each photo with its detection overlaid
+(green: corners used, red: detected but unused, cyan: board corners extrapolated from the
+pose, blue: board outline and axes), and the cameras in 3D around the board. `poses.json`
+next to it has the calibrated intrinsics and, per photo, the 3x4 camera-to-world matrix in
+the board frame in squares.
+
+`--square-m` gives the poses to the model as metric, with the mean camera distance's log fed
+to a third encoder. The model treats it as a hint rather than a constraint, and a wrong size
+does harm: on the duck capture the model's own scale guess was 200 mm per square, and giving
+it 25 mm made it settle on 11 mm, with its poses drifting to 1 degree and 15 % from the given
+ones so that the views no longer lined up. Use it only with the measured square size, and
+check the printed scale ratio.

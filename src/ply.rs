@@ -16,12 +16,14 @@ pub struct ColoredPoint {
 
 /// Foreground points of `point_map` whose confidence is at least `min_conf`, colored by `image`.
 ///
-/// Points are in the OpenCV camera convention (x right, y down, z forward); viewers
-/// expect y up, so points are turned 180 degrees around x (y and z negated).
+/// With `camera_frame`, points are in the OpenCV camera convention (x right, y down, z
+/// forward) and viewers expect y up, so they are turned 180 degrees around x (y and z
+/// negated); otherwise they are written as they are.
 pub fn confident_points(
     point_map: &PointMap,
     image: &RgbImage,
     min_conf: f32,
+    camera_frame: bool,
 ) -> Result<Vec<ColoredPoint>> {
     ensure!(
         (point_map.width as u32, point_map.height as u32) == image.dimensions(),
@@ -38,7 +40,7 @@ pub fn confident_points(
         .zip(&point_map.foreground)
         .filter(|(((conf, _), _), foreground)| **foreground && **conf >= min_conf)
         .map(|(((_, [x, y, z]), pixel), _)| ColoredPoint {
-            xyz: [*x, -y, -z],
+            xyz: if camera_frame { [*x, -y, -z] } else { [*x, *y, *z] },
             rgb: pixel.0,
         })
         .collect())

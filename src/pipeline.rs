@@ -4,12 +4,13 @@ use std::time::Instant;
 
 use anyhow::Result;
 use candle_core::Device;
-use nalgebra::{Matrix2, Vector2, Vector3};
+use nalgebra::{Matrix2, Matrix3, Vector2, Vector3};
 
 use crate::cleaning::{DepthView, zero_conf_in_front_of_other_views};
 use crate::image_input::InputImage;
 use crate::model::{MapAnything, ViewOutput};
 use crate::point_map::PointMap;
+use crate::pose_prior::PoseInputs;
 use crate::reconstruction::{Camera, Reconstruction, relative_to_first};
 
 /// Intrinsics are fit on every (side / this)-th pixel along each side, as upstream.
@@ -45,15 +46,98 @@ fn fit_intrinsics(view: &ViewOutput) -> ([f64; 2], [f64; 2]) {
     ([x[0], y[0]], [x[1], y[1]])
 }
 
+/// Ratio of the model's translation lengths (relative to view 0) to the given ones, over
+/// the views with a given pose: the model's scale in units of the given poses' scale.
+fn scale_ratio(relative: &[(Matrix3<f64>, Vector3<f64>)], priors: &PoseInputs) -> f64 {
+    let reference = priors.priors[0].expect("view 0 must have a pose");
+    let (mut model_sum, mut given_sum) = (0.0, 0.0);
+    for (prior, (_, translation)) in priors.priors.iter().zip(relative) {
+        if let Some(prior) = prior {
+            model_sum += translation.norm();
+            given_sum += (prior.translation - reference.translation).norm();
+        }
+    }
+    if given_sum > 0.0 { model_sum / given_sum } else { 1.0 }
+}
+
+/// Camera-to-world poses of every view when known poses were given: the known ones, and
+/// for views without one the model's prediction expressed relative to view 0, which is
+/// known. The world is the frame of the given poses, at the model's scale: the dense
+/// points are at that scale, and even with metric poses the model does not adopt the
+/// given scale exactly.
+fn poses_from_priors(
+    predicted: &[(Matrix3<f64>, Vector3<f64>)],
+    priors: &PoseInputs,
+) -> Vec<(Matrix3<f64>, Vector3<f64>)> {
+    let relative = relative_to_first(predicted);
+    let reference = priors.priors[0].expect("view 0 must have a pose");
+    let scale = scale_ratio(&relative, priors);
+    priors
+        .priors
+        .iter()
+        .zip(&relative)
+        .map(|(prior, (rotation, translation))| match prior {
+            Some(prior) => (
+                prior.rotation,
+                reference.translation * scale + (prior.translation - reference.translation) * scale,
+            ),
+            None => (
+                reference.rotation * rotation,
+                reference.translation * scale + reference.rotation * translation,
+            ),
+        })
+        .collect()
+}
+
+/// Prints how far the model's predicted poses are from the given ones (relative to view
+/// 0, after scaling), a check that the pose input is understood.
+fn report_pose_agreement(predicted: &[(Matrix3<f64>, Vector3<f64>)], priors: &PoseInputs) {
+    let relative = relative_to_first(predicted);
+    let reference = priors.priors[0].expect("view 0 must have a pose");
+    let given: Vec<Option<(Matrix3<f64>, Vector3<f64>)>> = priors
+        .priors
+        .iter()
+        .map(|prior| {
+            prior.map(|p| {
+                (
+                    reference.rotation.transpose() * p.rotation,
+                    reference.rotation.transpose() * (p.translation - reference.translation),
+                )
+            })
+        })
+        .collect();
+    let scale = scale_ratio(&relative, priors);
+    let (mut angle_sum, mut dist_sum, mut count) = (0.0, 0.0, 0);
+    for (g, (r, t)) in given.iter().zip(&relative) {
+        if let Some((gr, gt)) = g {
+            let cos = ((gr.transpose() * r).trace() - 1.0) / 2.0;
+            angle_sum += cos.clamp(-1.0, 1.0).acos().to_degrees();
+            dist_sum += (t - gt * scale).norm() / (gt.norm() * scale).max(1e-9);
+            count += 1;
+        }
+    }
+    if count > 0 {
+        println!(
+            "predicted poses vs given: mean rotation difference {:.2} degrees, mean position \
+             difference {:.1}% of the distance to view 0; the model's scale is {scale:.3} x the \
+             given one (one pose unit = {:.1} mm for the model)",
+            angle_sum / count as f64,
+            100.0 * dist_sum / count as f64,
+            1000.0 * scale * if priors.metric { priors.unit_m } else { 1.0 }
+        );
+    }
+}
+
 pub fn reconstruct(
     model: &MapAnything,
     images: &[InputImage],
+    priors: Option<&PoseInputs>,
     device: &Device,
 ) -> Result<Reconstruction> {
     let started = Instant::now();
     let tensors: Vec<_> = images.iter().map(|image| image.tensor.clone()).collect();
     let intrinsics: Vec<_> = images.iter().map(|image| image.intrinsics).collect();
-    let views = model.forward(&tensors, &intrinsics)?;
+    let views = model.forward(&tensors, &intrinsics, priors)?;
     device.synchronize()?;
     println!(
         "ran MapAnything on {} images in {:.2?}",
@@ -61,12 +145,17 @@ pub fn reconstruct(
         started.elapsed()
     );
 
-    let poses = relative_to_first(
-        &views
-            .iter()
-            .map(|view| (view.rotation, view.translation))
-            .collect::<Vec<_>>(),
-    );
+    let predicted: Vec<_> = views
+        .iter()
+        .map(|view| (view.rotation, view.translation))
+        .collect();
+    let poses = match priors {
+        Some(priors) => {
+            report_pose_agreement(&predicted, priors);
+            poses_from_priors(&predicted, priors)
+        }
+        None => relative_to_first(&predicted),
+    };
     let fitted: Vec<([f64; 2], [f64; 2])> = views.iter().map(fit_intrinsics).collect();
     let mut point_maps: Vec<PointMap> = views
         .iter()
